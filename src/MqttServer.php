@@ -1,120 +1,10 @@
 <?php
 
-class Client {
-    private $fd;
-    private $connectInfo;
-    public function __construct($fd, $connectInfo) {
-        $this->fd = $fd;
-        $this->connectInfo = $connectInfo;
-    }
-}
-
-class Packet {
-    private $data;
-    private $pos;
-
-    public function __construct(&$data) {
-        $this->data = $data;
-        $this->pos = 0;
-    }
-
-    public function getFixedHeader() {
-        if (strlen($this->data) < 2) {
-            throw new Exception("illegal MQTT protocol\n");
-        }
-        $byte = ord($this->data[0]);
-        $this->pos++;
-        $header['type'] = ($byte & 0xF0) >> 4;
-        $header['reserved'] = ($byte & 0x0F);
-        $header['dup'] = ($byte & 0x08) >> 3;
-        $header['qos'] = ($byte & 0x06) >> 1;
-        $header['retain'] = $byte & 0x01;
-        $header['length'] = $this->getLength();
-        return $header;
-    }
-
-    public function getConnectInfo() {
-        $length = $this->getMSBAndLSBValue();
-        $protocolName = substr($this->data, $this->pos, $length);
-        if ($protocolName != 'MQTT') {
-            throw new Exception("illegal MQTT Control Packet type\n");
-        }
-        $connectInfo['protocolName'] = $protocolName;
-        $this->pos += $length;
-        $connectInfo['version'] = ord(substr($this->data, $this->pos, 1));
-        $this->pos += 1;
-        $byte = ord($this->data[$this->pos]); // Connect Flags
-        $connectInfo['userNameFlag'] = ($byte & 0x80 == 0x80);
-        $connectInfo['passwordFlag'] = ($byte & 0x40 == 0x40);
-        $connectInfo['willRetain'] = ($byte & 0x20 == 0x20);
-        $connectInfo['willQos'] = ($byte & 0x18 >> 3);
-        $connectInfo['willFlag'] = ($byte & 0x04 == 0x04);
-        $connectInfo['cleanSession'] = ($byte & 0x02 == 0x02);
-        $connectInfo['reserved'] = ($byte & 0x01 == 0x01);
-        if ($connectInfo['reserved'] != 0) {
-            throw new Exception("illegal MQTT Control Packet type\n");
-        }
-        $this->pos += 1;
-        $connectInfo['keepalive'] = $this->getMSBAndLSBValue();
-        $connectInfo['clientId'] = $this->getClientId();
-        return $connectInfo;
-    }
-
-    // MSB+LSB
-    public function getMSBAndLSBValue() {
-        $value = 256 * ord($this->data[$this->pos+0]) + ord($this->data[$this->pos+1]);
-        $this->pos +=2;
-        return $value;
-    }
-
-    public function getByte() {
-        $byte = ord(substr($this->data, $this->pos, 1));
-        $this->pos += 1;
-        return $byte;
-    }
-
-    public function getString() {
-        $length = $this->getMSBAndLSBValue();
-        $string = substr($this->data, $this->pos, $length);
-        $this->pos += $length;
-        return $string;
-    }
-
-    public function getRemain() {
-        $remain = substr($this->data, $this->pos);
-        $this->pos = strlen($this->data)-1;
-        return $remain;
-    }
-
-    public function getLength() {
-        $dataSize = strlen($this->data);
-        $multiplier = 1;
-        $value = 0;
-        do {
-            if ($this->pos > ($dataSize-1)) {
-                throw new Exception("illegal MQTT protocol\n");
-            }
-            $digit = ord($this->data{$this->pos});
-            $value += ($digit & 127) * $multiplier;
-            $multiplier *= 128;
-            $this->pos++;
-        } while (($digit & 128) != 0);
-        return $value;
-    }
-
-    public function getClientId() {
-        $length = $this->getMSBAndLSBValue($this->data, $this->pos);
-        $clientId = substr($this->data, $this->pos, $length);
-        $this->pos += $length;
-        return $clientId;
-    }
-}
-
 class MqttServer {
 
     private $server;
     private $clients = []; // [fd]=>Client
-    private $topicFds = []; // [topic]=>[fd]=>fd
+    private $subscribeFds = []; // [topic]=>[fd]=>fd
 
     const COMMAND_CONNECT = 1;
     const COMMAND_CONNACK = 2;
@@ -141,7 +31,9 @@ class MqttServer {
             array(
                 'open_mqtt_protocol' => 1,
                 'worker_num' => 1,
+                'task_worker_num' => 4,
                 'log_file' => '/web/iot-swoole-server/runtime/log/swoole.log',
+                'log_level' => SWOOLE_LOG_INFO,
             )
         );
         $server->on('connect', function ($server, $fd){
@@ -159,13 +51,15 @@ class MqttServer {
             echo "connection close: {$fd}\n";
             unset($this->clients["$fd"]);
         });
+        $server->on('Task', [$this, 'onTask']);
+        $server->on('Finish', [$this, 'onFinish']);
+
         $server->start();
     }
 
     function handleCommand($fd, $data) {
         $packet = new Packet($data);
         $header = $packet->getFixedHeader();
-        var_dump($header);
         switch ($header['type']) {
             case self::COMMAND_CONNECT:
                 $connectInfo = $packet->getConnectInfo();
@@ -185,7 +79,7 @@ class MqttServer {
                 break;
             case self::COMMAND_SUBSCRIBE:
                 if ($header['reserved'] != 0x2) {
-                    throw new Exception('illegal MQTT Control Packet type\n');
+                    throw new Exception('reserved is no 2\n');
                 }
                 $packetIdentifier = $packet->getMSBAndLSBValue();
                 $topic = $packet->getString();
@@ -196,7 +90,7 @@ class MqttServer {
                 break;
             case self::COMMAND_UNSUBSCRIBE:
                 if ($header['reserved'] != 0x2) {
-                    throw new Exception('illegal MQTT Control Packet type\n');
+                    throw new Exception('reserved is no 2\n');
                 }
                 $packetIdentifier = $packet->getMSBAndLSBValue();
                 $topic = $packet->getString();
@@ -206,36 +100,34 @@ class MqttServer {
                 break;
             case self::COMMAND_PINGREQ:
                 $resp = $this->makePINGREQData();
-                echo "PINGREQ\n";
                 $this->server->send($fd, $resp);
                 break;
             case self::COMMAND_DISCONNECT:
                 break;
             default:
-                throw new Exception('illegal MQTT Control Packet type\n');
+                throw new Exception('illegal MQTT Control Packet command\n');
                 break;
         }
     }
 
     private function publish($topic, $data) {
-        if (!array_key_exists($topic, $this->topicFds)) {
+        if (!array_key_exists($topic, $this->subscribeFds)) {
             return;
         }
-        $fds = $this->topicFds[$topic];
+        $fds = $this->subscribeFds[$topic];
         if (!$fds) {
             return;
         }
-        foreach ($fds as $k => $fd) {
-            $this->server->send($fd, $data);
-        }
+        $json = json_encode(['cmd'=>'publish','fds'=>$fds,'data'=>$data]);
+        $this->server->task($json);
     }
 
     private function subscribe($topic, $fd) {
-        $this->topicFds[$topic][$fd] = $fd;
+        $this->subscribeFds[$topic][$fd] = $fd;
     }
 
     private function unsubscribe($topic, $fd) {
-        unset($this->topicFds[$topic][$fd]);
+        unset($this->subscribeFds[$topic][$fd]);
     }
 
     private function makeCONNACKData() {
@@ -275,6 +167,130 @@ class MqttServer {
         $byte = intval($packageIdentifier%256);
         $data .= chr($byte);
         return $data;
+    }
+
+    public function onTask(Swoole\Server $server, $worker_id, $task_id, $data) {
+        $arr = json_decode($data, true);
+        if (!$arr) {
+            return;
+        }
+        $cmd = $arr['cmd'];
+        switch ($cmd) {
+            case 'publish':
+                $fds = $arr['fds'];
+                foreach ($fds as $k => $fd) {
+                    $server->send($fd, $arr['data']);
+                }
+                break;
+            default:
+                break;
+        }
+
+        return $server->finish($data);
+    }
+
+    public function onFinish(Swoole\Server $server, $task_id, $data) {
+        echo 'Task finished #' . $task_id . '  #' . $data . PHP_EOL;
+    }
+}
+
+class Client {
+    private $fd;
+    private $connectInfo;
+    public function __construct($fd, $connectInfo) {
+        $this->fd = $fd;
+        $this->connectInfo = $connectInfo;
+    }
+}
+
+class Packet {
+    private $data;
+    private $pos;
+
+    public function __construct(&$data) {
+        $this->data = $data;
+        $this->pos = 0;
+    }
+
+    public function getFixedHeader() {
+        if (strlen($this->data) < 2) {
+            throw new Exception("illegal MQTT protocol (".__LINE__.")\n");
+        }
+        $byte = ord($this->data[0]);
+        $this->pos++;
+        $header['type'] = ($byte & 0xF0) >> 4;
+        $header['reserved'] = ($byte & 0x0F);
+        $header['dup'] = ($byte & 0x08) >> 3;
+        $header['qos'] = ($byte & 0x06) >> 1;
+        $header['retain'] = $byte & 0x01;
+        $header['length'] = $this->getLength();
+        return $header;
+    }
+
+    public function getConnectInfo() {
+        $connectInfo['protocolName'] = $this->getString();
+        if ($connectInfo['protocolName'] != 'MQTT') {
+            throw new Exception("protocol is not MQTT\n");
+        }
+        $connectInfo['version'] = ord(substr($this->data, $this->pos, 1));
+        $this->pos += 1;
+        $byte = ord($this->data[$this->pos]); // Connect Flags
+        $connectInfo['userNameFlag'] = ($byte & 0x80 == 0x80);
+        $connectInfo['passwordFlag'] = ($byte & 0x40 == 0x40);
+        $connectInfo['willRetain'] = ($byte & 0x20 == 0x20);
+        $connectInfo['willQos'] = ($byte & 0x18 >> 3);
+        $connectInfo['willFlag'] = ($byte & 0x04 == 0x04);
+        $connectInfo['cleanSession'] = ($byte & 0x02 == 0x02);
+        $connectInfo['reserved'] = ($byte & 0x01 == 0x01);
+        if ($connectInfo['reserved'] != 0) {
+            throw new Exception("reserved is not 0\n");
+        }
+        $this->pos += 1;
+        $connectInfo['keepalive'] = $this->getMSBAndLSBValue();
+        $connectInfo['clientId'] = $this->getString();
+        return $connectInfo;
+    }
+
+    // MSB+LSB
+    public function getMSBAndLSBValue() {
+        $value = 256 * ord($this->data[$this->pos+0]) + ord($this->data[$this->pos+1]);
+        $this->pos += 2;
+        return $value;
+    }
+
+    public function getByte() {
+        $byte = ord(substr($this->data, $this->pos, 1));
+        $this->pos += 1;
+        return $byte;
+    }
+
+    public function getString() {
+        $length = $this->getMSBAndLSBValue();
+        $string = substr($this->data, $this->pos, $length);
+        $this->pos += $length;
+        return $string;
+    }
+
+    public function getRemain() {
+        $remain = substr($this->data, $this->pos);
+        $this->pos = strlen($this->data)-1;
+        return $remain;
+    }
+
+    public function getLength() {
+        $dataSize = strlen($this->data);
+        $multiplier = 1;
+        $value = 0;
+        do {
+            if ($this->pos > ($dataSize-1)) {
+                throw new Exception("illegal MQTT protocol (".__LINE__.")\n");
+            }
+            $digit = ord($this->data{$this->pos});
+            $value += ($digit & 127) * $multiplier;
+            $multiplier *= 128;
+            $this->pos++;
+        } while (($digit & 128) != 0);
+        return $value;
     }
 }
 
